@@ -20,15 +20,14 @@ use_trend_filter = input.bool(false, "Trend Filter", tooltip="Only show engulfin
 trend_length = input.int(50, "EMA Length for Trend", minval=5, maxval=200, group="Pattern Filters")
 
 // Box Settings
-box_expiration_bars = input.int(100, "Box Expiration (bars)", minval=1, maxval=500, tooltip="How many bars before a setup expires", group="Box Settings")
+box_extend_bars = input.int(50, "Box Extension (bars)", minval=1, maxval=500, tooltip="How many bars to extend boxes initially", group="Box Settings")
 show_labels = input.bool(true, "Show Labels", group="Box Settings")
 box_border_width = input.int(2, "Border Width", minval=1, maxval=5, group="Box Settings")
 
 // Colors
 bullish_color = input.color(color.new(color.green, 80), "Bullish Box Color", group="Colors")
 bearish_color = input.color(color.new(color.red, 80), "Bearish Box Color", group="Colors")
-opposite_close_color = input.color(color.new(color.yellow, 60), "Opposite Close Color", group="Colors")
-expired_color = input.color(color.new(color.gray, 80), "Expired/Triggered Color", group="Colors")
+touched_color = input.color(color.new(color.yellow, 60), "Touched Box Color", group="Colors")
 h1_border = input.color(color.blue, "1H Border", group="Colors")
 h4_border = input.color(color.orange, "4H Border", group="Colors")
 daily_border = input.color(color.purple, "Daily Border", group="Colors")
@@ -39,10 +38,10 @@ monthly_border = input.color(color.gray, "Monthly Border", group="Colors")
 // BOX STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════════
 
-// Box states for Failed Engulfing Strategy
-ACTIVE = 0           // Initial state, waiting for a close on the opposite side.
-OPPOSITE_CLOSE = 1   // A candle has closed on the opposite side. Waiting for a re-test.
-EXPIRED = 2          // Trade triggered or time expiration reached.
+// Box states
+ACTIVE = 0
+OUTSIDE = 1 // A candle has closed outside the box
+EXPIRED = 2
 
 // Box tracking arrays
 var array<box> boxes = array.new<box>()
@@ -50,7 +49,6 @@ var array<int> box_states = array.new<int>()
 var array<int> box_creation_bars = array.new<int>()
 var array<string> box_timeframes = array.new<string>()
 var array<bool> box_is_bullish = array.new<bool>()
-var array<color> box_border_colors = array.new<color>()
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // ENGULFING PATTERN DETECTION FUNCTIONS
@@ -121,10 +119,9 @@ f_get_engulfing(en, tf) =>
 create_box(tf_name, tf_period, is_bullish, box_high, box_low, border_color, box_time) =>
     // Create the box
     box_color = is_bullish ? bullish_color : bearish_color
-    // Calculate a fixed extension based on the chart's timeframe bars. The box can be terminated earlier by the update_boxes logic.
-    time_extension_ms = box_expiration_bars * timeframe.in_seconds(timeframe.period) * 1000
-    right_time = box_time + time_extension_ms
-    new_box = box.new(box_time, box_high, right_time, box_low, xloc=xloc.bar_time, border_color=color.orange, border_width=box_border_width, bgcolor=box_color, extend=extend.none)
+    // Calculate time extension based on the pattern's timeframe
+    time_extension_ms = box_extend_bars * timeframe.in_seconds(tf_period) * 1000
+    new_box = box.new(box_time, box_high, box_time + time_extension_ms, box_low, xloc=xloc.bar_time, border_color=border_color, border_width=box_border_width, bgcolor=box_color, extend=extend.none)
     
     // Add to tracking arrays
     array.push(boxes, new_box)
@@ -132,7 +129,6 @@ create_box(tf_name, tf_period, is_bullish, box_high, box_low, border_color, box_
     array.push(box_creation_bars, bar_index) // Keep bar_index for creation bar reference
     array.push(box_timeframes, tf_name)
     array.push(box_is_bullish, is_bullish)
-    array.push(box_border_colors, color.orange)
     
     // Add label if enabled
     if show_labels
@@ -141,93 +137,30 @@ create_box(tf_name, tf_period, is_bullish, box_high, box_low, border_color, box_
         label_style = is_bullish ? label.style_label_up : label.style_label_down
         label.new(box_time, label_y, xloc=xloc.bar_time, text=label_text, color=border_color, textcolor=color.white, style=label_style, size=size.small)
 
-// Function to handle box creation for a specific timeframe
-handle_box_creation(tf_name, tf_period, border_color, is_bull, is_bear, high_val, low_val, time_val) =>
-    if is_bull
-        create_box(tf_name, tf_period, true, high_val, low_val, border_color, time_val)
-    if is_bear
-        create_box(tf_name, tf_period, false, high_val, low_val, border_color, time_val)
-
-// Function to update active boxes based on the Failed Engulfing strategy
+// Function to update active boxes
 update_boxes() =>
-    // These are local variables to the function, reset on every bar.
-    enter_short_signal = false
-    enter_long_signal = false
-
     if array.size(boxes) > 0
         for i = array.size(boxes) - 1 to 0
             box_id = array.get(boxes, i)
-            state = array.get(box_states, i)
+            initial_state = array.get(box_states, i)
 
-            if state == EXPIRED
-                continue
+            // Process only boxes that are within the current view and haven't expired
+            if initial_state != EXPIRED and time >= box.get_left(box_id) and time <= box.get_right(box_id)
+                box_top = box.get_top(box_id)
+                box_bottom = box.get_bottom(box_id)
 
-            // --- Time-based Expiration ---
-            creation_bar = array.get(box_creation_bars, i)
-            if bar_index > creation_bar + box_expiration_bars
-                array.set(box_states, i, EXPIRED)
-                box.set_bgcolor(box_id, expired_color)
-                box.set_right(box_id, time)
-                box.set_border_color(box_id, color.red)
-                continue
-
-            // --- State Transition & Trade Trigger Logic ---
-            is_bullish_box = array.get(box_is_bullish, i)
-            box_top = box.get_top(box_id)
-            box_bottom = box.get_bottom(box_id)
-
-            if state == ACTIVE
-                closed_above = close[1] > box_top
-                closed_below = close[1] < box_bottom
-
-                if is_bullish_box and closed_below
-                    // Bullish box breakout detected. Check for immediate retest.
-                    retested_from_below = high >= box_bottom
-                    if retested_from_below
+                // --- State Transition Logic ---
+                if initial_state == ACTIVE
+                    close_outside = close > box_top or close < box_bottom
+                    if close_outside
+                        array.set(box_states, i, OUTSIDE)
+                        box.set_bgcolor(box_id, touched_color) // Change color to indicate interaction
+                else // initial_state == OUTSIDE
+                    price_reenters = high >= box_bottom and low <= box_top
+                    if price_reenters
                         array.set(box_states, i, EXPIRED)
-                        box.set_bgcolor(box_id, expired_color)
-                        box.set_right(box_id, time)
-                        box.set_border_color(box_id, color.green)
-                        enter_short_signal = true
-                    else
-                        // Just a breakout. Change state and wait for retest.
-                        array.set(box_states, i, OPPOSITE_CLOSE)
-                        box.set_bgcolor(box_id, opposite_close_color)
-                
-                else if not is_bullish_box and closed_above
-                    // Bearish box breakout detected. Check for immediate retest.
-                    retested_from_above = low <= box_top
-                    if retested_from_above
-                        array.set(box_states, i, EXPIRED)
-                        box.set_bgcolor(box_id, expired_color)
-                        box.set_right(box_id, time)
-                        box.set_border_color(box_id, color.green)
-                        enter_long_signal = true
-                    else
-                        // Just a breakout. Change state and wait for retest.
-                        array.set(box_states, i, OPPOSITE_CLOSE)
-                        box.set_bgcolor(box_id, opposite_close_color)
-
-            else if state == OPPOSITE_CLOSE
-                // This handles retests on subsequent bars
-                retested_from_below = high >= box_bottom
-                retested_from_above = low <= box_top
-
-                if is_bullish_box and retested_from_below
-                    array.set(box_states, i, EXPIRED)
-                    box.set_bgcolor(box_id, expired_color)
-                    box.set_right(box_id, time)
-                    box.set_border_color(box_id, color.green)
-                    enter_short_signal = true
-                
-                else if not is_bullish_box and retested_from_above
-                    array.set(box_states, i, EXPIRED)
-                    box.set_bgcolor(box_id, expired_color)
-                    box.set_right(box_id, time)
-                    box.set_border_color(box_id, color.green)
-                    enter_long_signal = true
-
-    [enter_short_signal, enter_long_signal]
+                        box.set_bgcolor(box_id, color.new(color.gray, 80)) // Final expired color
+                        box.set_right(box_id, time) // Set the right edge to the current bar
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // MAIN LOGIC
@@ -250,29 +183,45 @@ tf_m = "M"
 [w_bull, w_bear, w_high, w_low, w_time] = f_get_engulfing(enable_weekly, tf_w)
 [m_bull, m_bear, m_high, m_low, m_time] = f_get_engulfing(enable_monthly, tf_m)
 
-// Create boxes on engulfing detection, ensuring only one box is created per signal
-// Create boxes on engulfing detection, ensuring only one box is created per signal
-handle_box_creation("Current", timeframe.period, color.gray, curr_bull and not nz(curr_bull[1]), curr_bear and not nz(curr_bear[1]), high_val, low_val, time_val)
-handle_box_creation("1H", tf_h1, h1_border, h1_bull and not nz(h1_bull[1]), h1_bear and not nz(h1_bear[1]), h1_high, h1_low, h1_time)
-handle_box_creation("4H", tf_h4, h4_border, h4_bull and not nz(h4_bull[1]), h4_bear and not nz(h4_bear[1]), h4_high, h4_low, h4_time)
-handle_box_creation("Daily", tf_d, daily_border, d_bull and not nz(d_bull[1]), d_bear and not nz(d_bear[1]), d_high, d_low, d_time)
-handle_box_creation("Weekly", tf_w, weekly_border, w_bull and not nz(w_bull[1]), w_bear and not nz(w_bear[1]), w_high, w_low, w_time)
-handle_box_creation("Monthly", tf_m, monthly_border, m_bull and not nz(m_bull[1]), m_bear and not nz(m_bear[1]), m_high, m_low, m_time)
+// Create boxes on engulfing detection
+if curr_bull
+    create_box("Current", timeframe.period, true, high_val, low_val, color.gray, time_val)
+if curr_bear
+    create_box("Current", timeframe.period, false, high_val, low_val, color.gray, time_val)
 
-// Update existing boxes and get trade signals
-[enter_short, enter_long] = update_boxes()
+if h1_bull
+    create_box("1H", tf_h1, true, h1_high, h1_low, h1_border, h1_time)
+if h1_bear
+    create_box("1H", tf_h1, false, h1_high, h1_low, h1_border, h1_time)
+
+if h4_bull
+    create_box("4H", tf_h4, true, h4_high, h4_low, h4_border, h4_time)
+if h4_bear
+    create_box("4H", tf_h4, false, h4_high, h4_low, h4_border, h4_time)
+
+if d_bull
+    create_box("Daily", tf_d, true, d_high, d_low, daily_border, d_time)
+if d_bear
+    create_box("Daily", tf_d, false, d_high, d_low, daily_border, d_time)
+
+if w_bull
+    create_box("Weekly", tf_w, true, w_high, w_low, weekly_border, w_time)
+if w_bear
+    create_box("Weekly", tf_w, false, w_high, w_low, weekly_border, w_time)
+
+if m_bull
+    create_box("Monthly", tf_m, true, m_high, m_low, monthly_border, m_time)
+if m_bear
+    create_box("Monthly", tf_m, false, m_high, m_low, monthly_border, m_time)
+
+// Update existing boxes
+update_boxes()
 
 // Plot engulfing signals on current timeframe
 plotshape(curr_bull, title="Bullish Engulfing", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
 plotshape(curr_bear, title="Bearish Engulfing", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small)
 
-// Plot failed engulfing trade entry signals
-plotshape(enter_short, title="Enter Short", location=location.abovebar, color=color.maroon, style=shape.arrowdown, size=size.normal, text="SHORT")
-plotshape(enter_long, title="Enter Long", location=location.belowbar, color=color.navy, style=shape.arrowup, size=size.normal, text="LONG")
-
 // Alert conditions
-alertcondition(curr_bull or curr_bear, "Engulfing Pattern", "Engulfing pattern detected on {{ticker}} {{interval}}")
-alertcondition(curr_bull, "Bullish Engulfing", "Bullish engulfing pattern detected on {{ticker}} {{interval}}")
-alertcondition(curr_bear, "Bearish Engulfing", "Bearish engulfing pattern detected on {{ticker}} {{interval}}")
-alertcondition(enter_short, "Enter Short Signal", "Failed bullish engulfing setup on {{ticker}} {{interval}}. Potential short entry.")
-alertcondition(enter_long, "Enter Long Signal", "Failed bearish engulfing setup on {{ticker}} {{interval}}. Potential long entry.")
+alertcondition(curr_bull or curr_bear, "Engulfing Pattern", "Engulfing pattern detected!")
+alertcondition(curr_bull, "Bullish Engulfing", "Bullish engulfing pattern detected!")
+alertcondition(curr_bear, "Bearish Engulfing", "Bearish engulfing pattern detected!")

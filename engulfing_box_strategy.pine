@@ -1,5 +1,5 @@
-//@version=5
-indicator("Multi-Timeframe Engulfing Box Tracker", overlay=true, max_boxes_count=200)
+// @version=5
+strategy("Engulfing Box Strategy", overlay=true, max_boxes_count=200, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // INPUTS & SETTINGS
@@ -36,6 +36,14 @@ weekly_border = input.color(color.fuchsia, "Weekly Border", group="Colors")
 monthly_border = input.color(color.gray, "Monthly Border", group="Colors")
 
 // ═══════════════════════════════════════════════════════════════════════════════════
+// STRATEGY SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+trade_direction = input.string("Both", "Trade Direction", options=["Long Only", "Short Only", "Both"], group="Strategy Settings")
+stop_loss_percent = input.float(2.0, "Stop Loss %", minval=0.1, maxval=50, step=0.1, group="Strategy Settings")
+take_profit_percent = input.float(4.0, "Take Profit %", minval=0.1, maxval=100, step=0.1, group="Strategy Settings")
+
+// ═══════════════════════════════════════════════════════════════════════════════════
 // BOX STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════════
 
@@ -51,6 +59,10 @@ var array<int> box_creation_bars = array.new<int>()
 var array<string> box_timeframes = array.new<string>()
 var array<bool> box_is_bullish = array.new<bool>()
 var array<color> box_border_colors = array.new<color>()
+
+// Global signal variables
+var g_enter_short = false
+var g_enter_long = false
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // ENGULFING PATTERN DETECTION FUNCTIONS
@@ -104,7 +116,7 @@ detect_engulfing() =>
 
 // Function to get timeframe data
 get_tf_engulfing(tf) =>
-    request.security(syminfo.tickerid, tf, detect_engulfing(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_on)
+    request.security(syminfo.tickerid, tf, detect_engulfing(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off) 
 
 // Helper function to conditionally get engulfing data
 f_get_engulfing(en, tf) =>
@@ -150,9 +162,8 @@ handle_box_creation(tf_name, tf_period, border_color, is_bull, is_bear, high_val
 
 // Function to update active boxes based on the Failed Engulfing strategy
 update_boxes() =>
-    // These are local variables to the function, reset on every bar.
-    enter_short_signal = false
-    enter_long_signal = false
+    enter_short = false
+    enter_long = false
 
     if array.size(boxes) > 0
         for i = array.size(boxes) - 1 to 0
@@ -188,7 +199,7 @@ update_boxes() =>
                         box.set_bgcolor(box_id, expired_color)
                         box.set_right(box_id, time)
                         box.set_border_color(box_id, color.green)
-                        enter_short_signal = true
+                        enter_short := true
                     else
                         // Just a breakout. Change state and wait for retest.
                         array.set(box_states, i, OPPOSITE_CLOSE)
@@ -202,7 +213,7 @@ update_boxes() =>
                         box.set_bgcolor(box_id, expired_color)
                         box.set_right(box_id, time)
                         box.set_border_color(box_id, color.green)
-                        enter_long_signal = true
+                        enter_long := true
                     else
                         // Just a breakout. Change state and wait for retest.
                         array.set(box_states, i, OPPOSITE_CLOSE)
@@ -218,20 +229,19 @@ update_boxes() =>
                     box.set_bgcolor(box_id, expired_color)
                     box.set_right(box_id, time)
                     box.set_border_color(box_id, color.green)
-                    enter_short_signal = true
+                    enter_short := true
                 
                 else if not is_bullish_box and retested_from_above
                     array.set(box_states, i, EXPIRED)
                     box.set_bgcolor(box_id, expired_color)
                     box.set_right(box_id, time)
                     box.set_border_color(box_id, color.green)
-                    enter_long_signal = true
+                    enter_long := true
+    [enter_short, enter_long]
 
-    [enter_short_signal, enter_long_signal]
-
-// ═══════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // MAIN LOGIC
-// ═══════════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 
 // Get current timeframe engulfing
 [curr_bull, curr_bear, high_val, low_val, time_val] = f_get_engulfing(enable_current_tf, timeframe.period)
@@ -251,7 +261,6 @@ tf_m = "M"
 [m_bull, m_bear, m_high, m_low, m_time] = f_get_engulfing(enable_monthly, tf_m)
 
 // Create boxes on engulfing detection, ensuring only one box is created per signal
-// Create boxes on engulfing detection, ensuring only one box is created per signal
 handle_box_creation("Current", timeframe.period, color.gray, curr_bull and not nz(curr_bull[1]), curr_bear and not nz(curr_bear[1]), high_val, low_val, time_val)
 handle_box_creation("1H", tf_h1, h1_border, h1_bull and not nz(h1_bull[1]), h1_bear and not nz(h1_bear[1]), h1_high, h1_low, h1_time)
 handle_box_creation("4H", tf_h4, h4_border, h4_bull and not nz(h4_bull[1]), h4_bear and not nz(h4_bear[1]), h4_high, h4_low, h4_time)
@@ -259,20 +268,42 @@ handle_box_creation("Daily", tf_d, daily_border, d_bull and not nz(d_bull[1]), d
 handle_box_creation("Weekly", tf_w, weekly_border, w_bull and not nz(w_bull[1]), w_bear and not nz(w_bear[1]), w_high, w_low, w_time)
 handle_box_creation("Monthly", tf_m, monthly_border, m_bull and not nz(m_bull[1]), m_bear and not nz(m_bear[1]), m_high, m_low, m_time)
 
-// Update existing boxes and get trade signals
-[enter_short, enter_long] = update_boxes()
+// Update existing boxes and set global trade signals
+[enter_short_signal, enter_long_signal] = update_boxes()
+g_enter_short := enter_short_signal
+g_enter_long := enter_long_signal
+
+// ═══════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ═══════════════════════════════════════════════════════════
+
+if barstate.isconfirmed
+    // Long Entry
+    if (g_enter_long and (trade_direction == "Long Only" or trade_direction == "Both"))
+        long_stop_loss = close * (1 - stop_loss_percent / 100)
+        long_take_profit = close * (1 + take_profit_percent / 100)
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Exit Long", from_entry="Long", loss=long_stop_loss, profit=long_take_profit)
+
+    // Short Entry
+    if (g_enter_short and (trade_direction == "Short Only" or trade_direction == "Both"))
+        short_stop_loss = close * (1 + stop_loss_percent / 100)
+        short_take_profit = close * (1 - take_profit_percent / 100)
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Exit Short", from_entry="Short", loss=short_stop_loss, profit=short_take_profit)
+
 
 // Plot engulfing signals on current timeframe
 plotshape(curr_bull, title="Bullish Engulfing", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
 plotshape(curr_bear, title="Bearish Engulfing", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small)
 
 // Plot failed engulfing trade entry signals
-plotshape(enter_short, title="Enter Short", location=location.abovebar, color=color.maroon, style=shape.arrowdown, size=size.normal, text="SHORT")
-plotshape(enter_long, title="Enter Long", location=location.belowbar, color=color.navy, style=shape.arrowup, size=size.normal, text="LONG")
+plotshape(g_enter_short, title="Enter Short", location=location.abovebar, color=color.maroon, style=shape.arrowdown, size=size.normal, text="SHORT")
+plotshape(g_enter_long, title="Enter Long", location=location.belowbar, color=color.navy, style=shape.arrowup, size=size.normal, text="LONG")
 
 // Alert conditions
 alertcondition(curr_bull or curr_bear, "Engulfing Pattern", "Engulfing pattern detected on {{ticker}} {{interval}}")
 alertcondition(curr_bull, "Bullish Engulfing", "Bullish engulfing pattern detected on {{ticker}} {{interval}}")
 alertcondition(curr_bear, "Bearish Engulfing", "Bearish engulfing pattern detected on {{ticker}} {{interval}}")
-alertcondition(enter_short, "Enter Short Signal", "Failed bullish engulfing setup on {{ticker}} {{interval}}. Potential short entry.")
-alertcondition(enter_long, "Enter Long Signal", "Failed bearish engulfing setup on {{ticker}} {{interval}}. Potential long entry.")
+alertcondition(g_enter_short, "Enter Short Signal", "Failed bullish engulfing setup on {{ticker}} {{interval}}. Potential short entry.")
+alertcondition(g_enter_long, "Enter Long Signal", "Failed bearish engulfing setup on {{ticker}} {{interval}}. Potential long entry.")
