@@ -1,0 +1,218 @@
+//@version=5
+indicator("Multi-Timeframe Engulfing Box Tracker", overlay=true, max_boxes_count=200)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// INPUTS & SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Timeframe Selection
+tf1 = input.timeframe("60", "Timeframe 1", group="Timeframes")
+tf2 = input.timeframe("240", "Timeframe 2", group="Timeframes")
+tf3 = input.timeframe("D", "Timeframe 3", group="Timeframes")
+tf4 = input.timeframe("W", "Timeframe 4", group="Timeframes")
+
+enable_tf1 = input.bool(true, "Enable TF1", group="Timeframes")
+enable_tf2 = input.bool(true, "Enable TF2", group="Timeframes")
+enable_tf3 = input.bool(true, "Enable TF3", group="Timeframes")
+enable_tf4 = input.bool(false, "Enable TF4", group="Timeframes")
+
+enable_current_tf = input.bool(true, "Enable Current TF", group="Timeframes")
+
+// Pattern Settings
+use_volume_filter = input.bool(true, "Volume Filter", tooltip="Require higher volume than previous bar", group="Pattern Filters")
+min_engulf_percent = input.float(0.0, "Min Engulfing %", minval=0.0, maxval=100.0, tooltip="Minimum percentage of previous candle body that must be engulfed", group="Pattern Filters")
+use_trend_filter = input.bool(false, "Trend Filter", tooltip="Only show engulfing patterns aligned with EMA trend", group="Pattern Filters")
+trend_length = input.int(50, "EMA Length for Trend", minval=5, maxval=200, group="Pattern Filters")
+
+// Box Settings
+box_extend_bars = input.int(50, "Box Extension (bars)", minval=1, maxval=500, tooltip="How many bars to extend boxes initially", group="Box Settings")
+show_labels = input.bool(true, "Show Labels", group="Box Settings")
+box_border_width = input.int(2, "Border Width", minval=1, maxval=5, group="Box Settings")
+
+// Colors
+bullish_color = input.color(color.new(color.green, 80), "Bullish Box Color", group="Colors")
+bearish_color = input.color(color.new(color.red, 80), "Bearish Box Color", group="Colors")
+touched_color = input.color(color.new(color.yellow, 60), "Touched Box Color", group="Colors")
+tf1_border = input.color(color.blue, "TF1 Border", group="Colors")
+tf2_border = input.color(color.orange, "TF2 Border", group="Colors")
+tf3_border = input.color(color.purple, "TF3 Border", group="Colors")
+tf4_border = input.color(color.fuchsia, "TF4 Border", group="Colors")
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// BOX STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Box states
+ACTIVE = 0
+OUTSIDE = 1 // A candle has closed outside the box
+EXPIRED = 2
+
+// Box tracking arrays
+var array<box> boxes = array.new<box>()
+var array<int> box_states = array.new<int>()
+var array<int> box_creation_bars = array.new<int>()
+var array<string> box_timeframes = array.new<string>()
+var array<bool> box_is_bullish = array.new<bool>()
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// ENGULFING PATTERN DETECTION FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Function to detect engulfing patterns
+detect_engulfing() =>
+    // Previous candle properties
+    prev_open = open[1]
+    prev_close = close[1]
+    prev_high = high[1]
+    prev_low = low[1]
+    prev_body_size = math.abs(prev_close - prev_open)
+    
+    // Current candle properties
+    curr_open = open
+    curr_close = close
+    curr_body_size = math.abs(curr_close - curr_open)
+    
+    // Basic engulfing conditions
+    is_prev_bearish = prev_close < prev_open
+    is_prev_bullish = prev_close > prev_open
+    is_curr_bearish = curr_close < curr_open
+    is_curr_bullish = curr_close > curr_open
+    
+    // Bullish engulfing: current bullish candle engulfs previous bearish candle
+    bullish_engulfing = is_prev_bearish and is_curr_bullish and curr_open <= prev_close and curr_close >= prev_open
+    
+    // Bearish engulfing: current bearish candle engulfs previous bullish candle
+    bearish_engulfing = is_prev_bullish and is_curr_bearish and curr_open >= prev_close and curr_close <= prev_open
+    
+    // Apply minimum engulfing percentage filter
+    // Add a small value to prev_body_size to avoid division by zero on doji candles
+    engulf_percent = curr_body_size / (prev_body_size + syminfo.mintick) * 100
+    valid_engulfing = engulf_percent >= min_engulf_percent
+    
+    // Volume filter (bypass if volume data is not available)
+    volume_condition = not use_volume_filter or na(volume) or (volume > volume[1])
+    
+    // Trend filter using EMA
+    ema = ta.ema(close, trend_length)
+    trend_up = close > ema
+    trend_down = close < ema
+    trend_condition = not use_trend_filter or (bullish_engulfing and trend_down) or (bearish_engulfing and trend_up)
+    
+    // Final validation
+    valid_bullish = bullish_engulfing and valid_engulfing and volume_condition and trend_condition
+    valid_bearish = bearish_engulfing and valid_engulfing and volume_condition and trend_condition
+    
+    [valid_bullish, valid_bearish, high, low, time]
+
+// Function to get timeframe data
+get_tf_engulfing(tf) =>
+    request.security(syminfo.tickerid, tf, detect_engulfing(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_on)
+
+// Helper function to conditionally get engulfing data
+f_get_engulfing(en, tf) =>
+    if en
+        get_tf_engulfing(tf)
+    else
+        [false, false, na, na, na]
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// BOX MANAGEMENT FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Function to create a new box
+create_box(tf_name, tf_period, is_bullish, box_high, box_low, border_color, box_time) =>
+    // Create the box
+    box_color = is_bullish ? bullish_color : bearish_color
+    // Calculate time extension based on the pattern's timeframe
+    time_extension_ms = box_extend_bars * timeframe.in_seconds(tf_period) * 1000
+    new_box = box.new(box_time, box_high, box_time + time_extension_ms, box_low, xloc=xloc.bar_time, border_color=border_color, border_width=box_border_width, bgcolor=box_color, extend=extend.none)
+    
+    // Add to tracking arrays
+    array.push(boxes, new_box)
+    array.push(box_states, ACTIVE)
+    array.push(box_creation_bars, bar_index) // Keep bar_index for creation bar reference
+    array.push(box_timeframes, tf_name)
+    array.push(box_is_bullish, is_bullish)
+    
+    // Add label if enabled
+    if show_labels
+        label_text = tf_name + " " + (is_bullish ? "Bull" : "Bear")
+        label_y = is_bullish ? box_low : box_high
+        label_style = is_bullish ? label.style_label_up : label.style_label_down
+        label.new(box_time, label_y, xloc=xloc.bar_time, text=label_text, color=border_color, textcolor=color.white, style=label_style, size=size.small)
+
+// Function to update active boxes
+update_boxes() =>
+    if array.size(boxes) > 0
+        for i = array.size(boxes) - 1 to 0
+            box_id = array.get(boxes, i)
+            initial_state = array.get(box_states, i)
+
+            // Process only boxes that are within the current view and haven't expired
+            if initial_state != EXPIRED and time >= box.get_left(box_id) and time <= box.get_right(box_id)
+                box_top = box.get_top(box_id)
+                box_bottom = box.get_bottom(box_id)
+
+                // --- State Transition Logic ---
+                if initial_state == ACTIVE
+                    close_outside = close > box_top or close < box_bottom
+                    if close_outside
+                        array.set(box_states, i, OUTSIDE)
+                        box.set_bgcolor(box_id, touched_color) // Change color to indicate interaction
+                else // initial_state == OUTSIDE
+                    price_reenters = high >= box_bottom and low <= box_top
+                    if price_reenters
+                        array.set(box_states, i, EXPIRED)
+                        box.set_bgcolor(box_id, color.new(color.gray, 80)) // Final expired color
+                        box.set_right(box_id, time) // Set the right edge to the current bar
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// MAIN LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Get current timeframe engulfing
+[curr_bull, curr_bear, high_val, low_val, time_val] = f_get_engulfing(enable_current_tf, timeframe.period)
+
+// Multi-timeframe detection
+[tf1_bull, tf1_bear, tf1_high, tf1_low, tf1_time] = f_get_engulfing(enable_tf1, tf1)
+[tf2_bull, tf2_bear, tf2_high, tf2_low, tf2_time] = f_get_engulfing(enable_tf2, tf2)
+[tf3_bull, tf3_bear, tf3_high, tf3_low, tf3_time] = f_get_engulfing(enable_tf3, tf3)
+[tf4_bull, tf4_bear, tf4_high, tf4_low, tf4_time] = f_get_engulfing(enable_tf4, tf4)
+
+// Create boxes on engulfing detection
+if curr_bull
+    create_box("Current", timeframe.period, true, high_val, low_val, color.gray, time_val)
+if curr_bear
+    create_box("Current", timeframe.period, false, high_val, low_val, color.gray, time_val)
+
+if tf1_bull
+    create_box("TF1", tf1, true, tf1_high, tf1_low, tf1_border, tf1_time)
+if tf1_bear
+    create_box("TF1", tf1, false, tf1_high, tf1_low, tf1_border, tf1_time)
+
+if tf2_bull
+    create_box("TF2", tf2, true, tf2_high, tf2_low, tf2_border, tf2_time)
+if tf2_bear
+    create_box("TF2", tf2, false, tf2_high, tf2_low, tf2_border, tf2_time)
+
+if tf3_bull
+    create_box("TF3", tf3, true, tf3_high, tf3_low, tf3_border, tf3_time)
+if tf3_bear
+    create_box("TF3", tf3, false, tf3_high, tf3_low, tf3_border, tf3_time)
+
+if tf4_bull
+    create_box("TF4", tf4, true, tf4_high, tf4_low, tf4_border, tf4_time)
+if tf4_bear
+    create_box("TF4", tf4, false, tf4_high, tf4_low, tf4_border, tf4_time)
+
+// Update existing boxes
+update_boxes()
+
+// Plot engulfing signals on current timeframe
+plotshape(curr_bull, title="Bullish Engulfing", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
+plotshape(curr_bear, title="Bearish Engulfing", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small)
+
+// Alert conditions
+alertcondition(curr_bull or curr_bear, "Engulfing Pattern", "Engulfing pattern detected!")
+alertcondition(curr_bull, "Bullish Engulfing", "Bullish engulfing pattern detected!")
+alertcondition(curr_bear, "Bearish Engulfing", "Bearish engulfing pattern detected!")
